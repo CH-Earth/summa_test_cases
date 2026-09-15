@@ -22,6 +22,14 @@ between the runs, then:
     python3 post_scripts/verify_output.py Solver celia1990 mizoguchi1990
     python3 post_scripts/verify_output.py Version --per-var
 
+"Executables" (the settings.json key) is not itself an axis -- it is what
+`run` reads to pick a binary. Version is the axis that compares actors vs
+non-actors. If non-actors has multiple named builds (settings.json
+Executables.non-actors.before/after), a plain, untagged actors run still
+pairs against *each* of them for the Version comparison -- the two rows are
+told apart by a "[tag]" suffix on whichever side carries one, e.g.
+"actors vs non-actors[after]".
+
 For every test it pairs up the output files that differ only along the chosen
 axis (holding the other components fixed) and reports two tables:
 
@@ -139,10 +147,56 @@ def _as_float(ncvar):
     return np.ma.filled(ncvar[:].astype("float64"), np.nan)
 
 
+# SUMMA gives every snow/soil layer variable a fixed-size axis sized for the
+# worst-case layer count; whatever is beyond the *actual* (per timestep, per
+# HRU) nSnow/nSoil layer count is undefined padding (a large sentinel like
+# -9999), not a real value. Comparing that padding makes an actors/non-actors
+# diff look enormous even when every real layer agrees -- so it is masked out
+# of every stat below, keyed off which layer-axis the variable uses.
+LAYER_COUNT_VAR = {
+    "midSnow": "nSnow", "ifcSnow": "nSnow",
+    "midSoil": "nSoil", "ifcSoil": "nSoil",
+    "midToto": "nSnowSoil", "ifcToto": "nSnowSoil",
+}
+INTERFACE_DIMS = {"ifcSnow", "ifcSoil", "ifcToto"}  # one more valid entry than the layer count
+
+
+def _layer_counts(ds):
+    """{"nSnow": arr, "nSoil": arr, "nSnowSoil": arr, "dims": (...)}, or {} if unavailable."""
+    if "nSnow" not in ds.variables or "nSoil" not in ds.variables:
+        return {}
+    nSnow = _as_float(ds.variables["nSnow"])
+    nSoil = _as_float(ds.variables["nSoil"])
+    return {"nSnow": nSnow, "nSoil": nSoil, "nSnowSoil": nSnow + nSoil,
+            "dims": ds.variables["nSnow"].dimensions}
+
+
+def _layer_validity(counts, ncvar):
+    """
+    Boolean array shaped like `ncvar` marking which entries are real active
+    layers rather than fixed-size padding -- or None if `ncvar` has no
+    snow/soil layer axis (or the layer counts aren't available / don't line
+    up with it, in which case nothing is masked).
+    """
+    dims = ncvar.dimensions
+    layer_axis = next((i for i, d in enumerate(dims) if d in LAYER_COUNT_VAR), None)
+    if layer_axis is None or not counts:
+        return None
+    if tuple(d for d in dims if d != dims[layer_axis]) != counts["dims"]:
+        return None  # unexpected layout -- don't guess, just leave it unmasked
+    n_active = counts[LAYER_COUNT_VAR[dims[layer_axis]]]
+    if dims[layer_axis] in INTERFACE_DIMS:
+        n_active = n_active + 1
+    n_layer = ncvar.shape[layer_axis]
+    idx = np.arange(n_layer).reshape([n_layer if a == layer_axis else 1 for a in range(len(dims))])
+    return idx < np.expand_dims(n_active, axis=layer_axis)
+
+
 def compare_files(ref_file, cmp_file, variables, per_var):
     """Aggregate |ref - cmp| over all listed variables that both files carry."""
     ref = Dataset(ref_file)
     cmp = Dataset(cmp_file)
+    counts_ref, counts_cmp = _layer_counts(ref), _layer_counts(cmp)
     n_total = n_diff = 0
     sum_abs = sumsq = 0.0
     max_abs = max_rel = 0.0
@@ -151,17 +205,34 @@ def compare_files(ref_file, cmp_file, variables, per_var):
             continue
         a = _as_float(ref.variables[var])
         b = _as_float(cmp.variables[var])
+        valid_a = _layer_validity(counts_ref, ref.variables[var])
+        valid_b = _layer_validity(counts_cmp, cmp.variables[var])
         if a.shape != b.shape:
             # tolerate a difference that is only singleton (length-1) dimensions,
             # e.g. (1007, 50, 1) vs (1007, 50)
             sa, sb = np.squeeze(a), np.squeeze(b)
             if sa.shape == sb.shape:
                 a, b = sa, sb
+                valid_a = valid_b = None  # axis alignment for masking no longer guaranteed
             else:
                 print(f"    {var}: SHAPE MISMATCH {a.shape} vs {b.shape}")
                 continue
+        valid = None
+        if valid_a is not None or valid_b is not None:
+            valid = np.ones(a.shape, dtype=bool)
+            if valid_a is not None:
+                valid &= valid_a
+            if valid_b is not None:
+                valid &= valid_b
         d = np.abs(a - b)
         d = np.where(np.isnan(d), 0.0, d)
+        if valid is not None:
+            # padding on either side isn't a real value to compare -- zero it
+            # out of the diff and drop it from the totals below, and keep it
+            # out of `a`'s own scale so a padded cell (e.g. -9999) can't
+            # dominate the relative-difference denominator either
+            a = np.where(valid, a, 0.0)
+            d = np.where(valid, d, 0.0)
         abs_a = np.abs(a)
         scale = float(np.nanmax(abs_a)) if abs_a.size and np.isfinite(abs_a).any() else 0.0
         if scale > 0.0:
@@ -172,7 +243,7 @@ def compare_files(ref_file, cmp_file, variables, per_var):
             rel = d / denom
         v_max = float(d.max()) if d.size else 0.0
         v_rel = float(np.nanmax(rel)) if np.isfinite(rel).any() else 0.0
-        n_total += d.size
+        n_total += int(valid.sum()) if valid is not None else d.size
         n_diff += int(np.count_nonzero(d))
         sum_abs += float(d.sum())
         sumsq += float((d * d).sum())
@@ -230,15 +301,21 @@ def main():
                 continue
             variables = parse_output_vars(oc_path)
 
-            # group this test's output files by everything except the chosen axis
+            # group this test's output files by everything except the chosen
+            # axis. For Version/Solver/Precision the Tag is *also* left out of
+            # the grouping key (but kept per-file) so e.g. a single untagged
+            # "actors" build still pairs up against each of several
+            # differently-tagged "non-actors" builds instead of being
+            # silently skipped for not sharing a Tag.
             groups = {}
             out_glob = os.path.join(OUTPUT_DIR, test_name, prefix + "_*_timestep.nc")
             for path in sorted(glob.glob(out_glob)):
                 comps = split_tag(os.path.basename(path), prefix)
                 if comps is None:
                     continue
-                key = tuple(c for i, c in enumerate(comps) if i != idx)
-                groups.setdefault(key, {})[comps[idx]] = path
+                drop = {idx} if axis == "Tag" else {idx, AXES["Tag"]}
+                key = tuple(c for i, c in enumerate(comps) if i not in drop)
+                groups.setdefault(key, {}).setdefault(comps[idx], []).append((comps[3], path))
 
             for key, by_axis in sorted(groups.items()):
                 if len(by_axis) < 2:
@@ -247,17 +324,22 @@ def main():
                 values = sorted(by_axis)
                 ref_val = values[0]
                 for cmp_val in values[1:]:
-                    n_pairs += 1
-                    label = f"{test_name}/{prefix}"
-                    if per_var:
-                        print(f"\n{label}  [{held}]  ref={ref_val} vs cmp={cmp_val}")
-                    ref_path, cmp_path = by_axis[ref_val], by_axis[cmp_val]
-                    stats = compare_files(ref_path, cmp_path, variables, per_var)
-                    ref_rs = load_run_stats(test_name, sub_test,
-                                            tag_string(split_tag(os.path.basename(ref_path), prefix)))
-                    cmp_rs = load_run_stats(test_name, sub_test,
-                                            tag_string(split_tag(os.path.basename(cmp_path), prefix)))
-                    rows.append((label, held, f"{ref_val} vs {cmp_val}", stats, ref_rs, cmp_rs))
+                    # cross product: e.g. one untagged "actors" build against
+                    # every differently-tagged "non-actors" build
+                    for ref_tag, ref_path in sorted(by_axis[ref_val]):
+                        for cmp_tag, cmp_path in sorted(by_axis[cmp_val]):
+                            n_pairs += 1
+                            label = f"{test_name}/{prefix}"
+                            ref_label = ref_val + (f"[{ref_tag}]" if axis != "Tag" and ref_tag else "")
+                            cmp_label = cmp_val + (f"[{cmp_tag}]" if axis != "Tag" and cmp_tag else "")
+                            if per_var:
+                                print(f"\n{label}  [{held}]  ref={ref_label} vs cmp={cmp_label}")
+                            stats = compare_files(ref_path, cmp_path, variables, per_var)
+                            ref_rs = load_run_stats(test_name, sub_test,
+                                                    tag_string(split_tag(os.path.basename(ref_path), prefix)))
+                            cmp_rs = load_run_stats(test_name, sub_test,
+                                                    tag_string(split_tag(os.path.basename(cmp_path), prefix)))
+                            rows.append((label, held, f"{ref_label} vs {cmp_label}", stats, ref_rs, cmp_rs))
 
     if not rows:
         print(f"No comparable pairs for axis '{axis}'. Run the tests twice, "
