@@ -87,6 +87,7 @@ subRouting                      timeDlay        ! (27) choice of method for sub-
 ! (12) choice of lower boundary conditions for thermodynamics
 ! presTemp  ! prescribed temperature
 ! zeroFlux  ! zero flux
+! presFlux  ! prescribed energy flux, the geothermal heat flux (parameter lowerBoundNrgFlux)
 ! -----------------------------------------------------------------------------------------------
 ! (13) choice of upper boundary conditions for soil hydrology
 ! presHead  ! prescribed head (volumetric liquid water content for mixed form of Richards' eqn)
