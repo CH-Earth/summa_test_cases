@@ -384,7 +384,7 @@ def main():
 
     def emit(title, num_headers, make_cells):
         hdr = row_line("test / prefix", [h for h, _cs, _w in mids], num_headers)
-        print(f"\n{axis} comparison  —  {title}")
+        print(f"\n{axis} comparison  -  {title}")
         if caption:
             print(caption + "\n")
         print(hdr)
